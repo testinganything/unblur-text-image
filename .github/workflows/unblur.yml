@@ -84,77 +84,98 @@ jobs:
           h0, w0 = img_bgr.shape[:2]
           print(f"Original size: {w0}x{h0}")
 
-          # Keep a reasonable size for the model (NAFNet is trained around 512–1024)
-          max_side = 1024
-          scale = min(1.0, max_side / max(h0, w0))
-          if scale < 1.0:
-              new_w, new_h = int(w0 * scale), int(h0 * scale)
-              img_bgr = cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
-              print(f"Resized for model: {new_w}x{new_h}")
+          # ---------- 2. Pad / resize to a size NAFNet can handle ----------
+          # NAFNet internal downsampling fails on very small heights (e.g. 146px).
+          # We pad to at least 256x256 and make both dims multiple of 16.
+          MIN_SIDE = 256
+          MULTIPLE = 16
 
-          # ---------- 2. Download NAFNet ONNX (real neural deblur) ----------
+          pad_top = pad_bottom = pad_left = pad_right = 0
+          work = img_bgr.copy()
+
+          # First ensure minimum size by padding with white (good for text)
+          if h0 < MIN_SIDE or w0 < MIN_SIDE:
+              new_h = max(h0, MIN_SIDE)
+              new_w = max(w0, MIN_SIDE)
+              # center the original image
+              pad_top = (new_h - h0) // 2
+              pad_bottom = new_h - h0 - pad_top
+              pad_left = (new_w - w0) // 2
+              pad_right = new_w - w0 - pad_left
+              work = cv2.copyMakeBorder(work, pad_top, pad_bottom, pad_left, pad_right,
+                                        cv2.BORDER_CONSTANT, value=(255, 255, 255))
+              print(f"Padded to min size: {work.shape[1]}x{work.shape[0]}")
+
+          # Now make multiple of 16
+          h, w = work.shape[:2]
+          new_h = ((h + MULTIPLE - 1) // MULTIPLE) * MULTIPLE
+          new_w = ((w + MULTIPLE - 1) // MULTIPLE) * MULTIPLE
+          extra_h = new_h - h
+          extra_w = new_w - w
+          if extra_h or extra_w:
+              work = cv2.copyMakeBorder(work, 0, extra_h, 0, extra_w,
+                                        cv2.BORDER_REFLECT_101)
+              print(f"Padded to multiple of {MULTIPLE}: {work.shape[1]}x{work.shape[0]}")
+
+          # ---------- 3. Download NAFNet ONNX ----------
           model_path = "nafnet.onnx"
           if not os.path.exists(model_path):
               print("=== Downloading NAFNet model (~92 MB) ===")
               model_url = "https://huggingface.co/opencv/deblurring_nafnet/resolve/main/deblurring_nafnet_2025may.onnx"
               download(model_url, out_path=model_path)
 
-          # ---------- 3. Neural deblurring ----------
+          # ---------- 4. Neural deblurring ----------
           print("=== Running NAFNet deblur (CPU) ===")
           session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
           input_name = session.get_inputs()[0].name
 
-          # NAFNet expects RGB float32 [0,1], NCHW
-          img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+          img_rgb = cv2.cvtColor(work, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
           blob = np.transpose(img_rgb, (2, 0, 1))[None, ...]  # 1x3xHxW
 
-          # Some ONNX exports want fixed size; we pad to multiple of 8 if needed
-          _, _, h, w = blob.shape
-          pad_h = (8 - h % 8) % 8
-          pad_w = (8 - w % 8) % 8
-          if pad_h or pad_w:
-              blob = np.pad(blob, ((0,0),(0,0),(0,pad_h),(0,pad_w)), mode="reflect")
-
           out = session.run(None, {input_name: blob})[0]
-          out = out[0, :, :h, :w]  # remove pad
+          out = out[0]  # 3xHxW
           out = np.transpose(out, (1, 2, 0))
           out = np.clip(out * 255.0, 0, 255).astype(np.uint8)
-          deblurred_bgr = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
+          deblurred = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
 
-          # Resize back to original if we downscaled
-          if scale < 1.0:
-              deblurred_bgr = cv2.resize(deblurred_bgr, (w0, h0), interpolation=cv2.INTER_LANCZOS4)
+          # Crop back to the original content region (remove the padding we added)
+          # First remove the multiple-of-16 extra padding
+          deblurred = deblurred[:h, :w]
+          # Then remove the min-size padding to recover original dimensions
+          if pad_top or pad_bottom or pad_left or pad_right:
+              deblurred = deblurred[pad_top:pad_top+h0, pad_left:pad_left+w0]
 
-          cv2.imwrite("deblurred_color.png", deblurred_bgr)
+          # Safety resize if anything went wrong
+          if deblurred.shape[0] != h0 or deblurred.shape[1] != w0:
+              deblurred = cv2.resize(deblurred, (w0, h0), interpolation=cv2.INTER_LANCZOS4)
+
+          cv2.imwrite("deblurred_color.png", deblurred)
           print("Saved deblurred_color.png")
 
-          # ---------- 4. Text-optimized post-process ----------
-          gray = cv2.cvtColor(deblurred_bgr, cv2.COLOR_BGR2GRAY)
+          # ---------- 5. Text-optimized post-process ----------
+          gray = cv2.cvtColor(deblurred, cv2.COLOR_BGR2GRAY)
 
-          # Mild denoise + CLAHE
-          den = cv2.fastNlMeansDenoising(gray, h=6)
-          clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+          den = cv2.fastNlMeansDenoising(gray, h=5)
+          clahe = cv2.createCLAHE(clipLimit=3.5, tileGridSize=(8, 8))
           enh = clahe.apply(den)
 
-          # Stronger unsharp for text edges
-          blur = cv2.GaussianBlur(enh, (0, 0), 1.2)
-          sharp = cv2.addWeighted(enh, 2.0, blur, -1.0, 0)
+          # Unsharp
+          blur = cv2.GaussianBlur(enh, (0, 0), 1.0)
+          sharp = cv2.addWeighted(enh, 2.2, blur, -1.2, 0)
 
-          # Adaptive threshold (much better than global Otsu for text)
+          # Adaptive threshold – good for text of varying thickness
           binary = cv2.adaptiveThreshold(
               sharp, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-              cv2.THRESH_BINARY, 31, 12
+              cv2.THRESH_BINARY, 25, 10
           )
 
-          # Optional morphological clean-up (remove tiny speckles, close gaps)
-          kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+          # Light morphology to clean noise while keeping thin strokes
+          kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 1))
           binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
-          binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
 
           cv2.imwrite("unblurred_text.png", binary)
           print("Saved unblurred_text.png")
 
-          # Also save a high-contrast grayscale version (often best for reading)
           cv2.imwrite("unblurred_gray.png", sharp)
           print("Saved unblurred_gray.png")
 
