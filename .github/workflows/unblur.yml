@@ -1,0 +1,54 @@
+name: Unblur Text Image
+on:
+  workflow_dispatch:
+    inputs:
+      image_url:
+        description: 'Direct URL to the blurry image (PNG/JPG)'
+        required: true
+        type: string
+
+jobs:
+  enhance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install opencv-python-headless pillow numpy requests
+
+      - name: Download + enhance
+        run: |
+          python - << 'EOF'
+          import cv2, numpy as np, requests, sys
+          url = "${{ github.event.inputs.image_url }}"
+          print(f"Downloading: {url}")
+          r = requests.get(url, timeout=60)
+          r.raise_for_status()
+          img_array = np.frombuffer(r.content, np.uint8)
+          img = cv2.imdecode(img_array, cv2.IMREAD_GRAYSCALE)
+          if img is None:
+              raise SystemExit("Failed to decode image – check that the URL points to a valid image")
+          # Denoise
+          den = cv2.fastNlMeansDenoising(img, h=8)
+          # Contrast enhancement
+          clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8,8))
+          enh = clahe.apply(den)
+          # Unsharp mask
+          blur = cv2.GaussianBlur(enh, (0,0), 1.5)
+          sharp = cv2.addWeighted(enh, 1.8, blur, -0.8, 0)
+          # Binary threshold for clean black text on white
+          _, bin_img = cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+          cv2.imwrite("unblurred.png", bin_img)
+          print("Done → unblurred.png")
+          EOF
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: unblurred-image
+          path: unblurred.png
