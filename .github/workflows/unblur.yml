@@ -24,15 +24,68 @@ jobs:
       - name: Download + enhance
         run: |
           python - << 'EOF'
-          import cv2, numpy as np, requests, sys
+          import cv2, numpy as np, requests, sys, time, subprocess, os
+
           url = "${{ github.event.inputs.image_url }}"
           print(f"Downloading: {url}")
-          r = requests.get(url, timeout=60)
-          r.raise_for_status()
-          img_array = np.frombuffer(r.content, np.uint8)
+
+          headers = {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+              "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+              "Accept-Language": "en-US,en;q=0.9",
+              "Referer": "https://catbox.moe/",
+          }
+
+          content = None
+          last_err = None
+
+          # Try requests with retries + browser headers
+          for attempt in range(4):
+              try:
+                  r = requests.get(url, headers=headers, timeout=90, allow_redirects=True)
+                  r.raise_for_status()
+                  content = r.content
+                  print(f"Downloaded with requests ({len(content)} bytes)")
+                  break
+              except Exception as e:
+                  last_err = e
+                  print(f"requests attempt {attempt+1} failed: {e}")
+                  time.sleep(2 + attempt)
+
+          # Fallback to curl (often works when requests is blocked)
+          if content is None:
+              print("Falling back to curl...")
+              try:
+                  result = subprocess.run(
+                      ["curl", "-L", "-A", headers["User-Agent"], "-H", "Accept: image/*,*/*",
+                       "-H", "Referer: https://catbox.moe/", "--fail", "--silent", "--show-error",
+                       "-o", "downloaded.bin", url],
+                      capture_output=True, text=True, timeout=90
+                  )
+                  if result.returncode == 0 and os.path.exists("downloaded.bin"):
+                      with open("downloaded.bin", "rb") as f:
+                          content = f.read()
+                      print(f"Downloaded with curl ({len(content)} bytes)")
+                  else:
+                      print("curl stderr:", result.stderr)
+              except Exception as e:
+                  last_err = e
+                  print(f"curl failed: {e}")
+
+          if content is None or len(content) < 100:
+              raise SystemExit(f"Could not download image. Last error: {last_err}")
+
+          img_array = np.frombuffer(content, np.uint8)
           img = cv2.imdecode(img_array, cv2.IMREAD_GRAYSCALE)
           if img is None:
-              raise SystemExit("Failed to decode image – check that the URL points to a valid image")
+              # try color then convert
+              img_color = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+              if img_color is None:
+                  raise SystemExit("Failed to decode image – check that the URL points to a valid image file")
+              img = cv2.cvtColor(img_color, cv2.COLOR_BGR2GRAY)
+
+          print(f"Image size: {img.shape[1]}x{img.shape[0]}")
+
           # Denoise
           den = cv2.fastNlMeansDenoising(img, h=8)
           # Contrast enhancement
