@@ -1,4 +1,4 @@
-name: Unblur Text Image
+name: Unblur Text Image (Advanced)
 on:
   workflow_dispatch:
     inputs:
@@ -10,6 +10,7 @@ on:
 jobs:
   enhance:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -19,89 +20,152 @@ jobs:
           python-version: '3.11'
 
       - name: Install deps
-        run: pip install opencv-python-headless pillow numpy requests
+        run: |
+          pip install opencv-python-headless pillow numpy requests onnxruntime
 
-      - name: Download + enhance
+      - name: Download NAFNet model + process image
         run: |
           python - << 'EOF'
-          import cv2, numpy as np, requests, sys, time, subprocess, os
+          import cv2
+          import numpy as np
+          import requests
+          import time
+          import subprocess
+          import os
+          import onnxruntime as ort
 
-          url = "${{ github.event.inputs.image_url }}"
-          print(f"Downloading: {url}")
-
-          headers = {
-              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-              "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-              "Accept-Language": "en-US,en;q=0.9",
-              "Referer": "https://catbox.moe/",
-          }
-
-          content = None
-          last_err = None
-
-          # Try requests with retries + browser headers
-          for attempt in range(4):
-              try:
-                  r = requests.get(url, headers=headers, timeout=90, allow_redirects=True)
-                  r.raise_for_status()
-                  content = r.content
-                  print(f"Downloaded with requests ({len(content)} bytes)")
-                  break
-              except Exception as e:
-                  last_err = e
-                  print(f"requests attempt {attempt+1} failed: {e}")
-                  time.sleep(2 + attempt)
-
-          # Fallback to curl (often works when requests is blocked)
-          if content is None:
-              print("Falling back to curl...")
-              try:
+          def download(url, out_path=None, referer="https://huggingface.co/"):
+              headers = {
+                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+                  "Accept": "*/*",
+                  "Referer": referer,
+              }
+              content = None
+              last_err = None
+              for attempt in range(5):
+                  try:
+                      r = requests.get(url, headers=headers, timeout=120, allow_redirects=True, stream=True)
+                      r.raise_for_status()
+                      content = r.content
+                      print(f"Downloaded {url} → {len(content)} bytes")
+                      break
+                  except Exception as e:
+                      last_err = e
+                      print(f"attempt {attempt+1} failed: {e}")
+                      time.sleep(3 + attempt)
+              if content is None:
+                  print("Falling back to curl...")
+                  tmp = out_path or "tmp.bin"
                   result = subprocess.run(
-                      ["curl", "-L", "-A", headers["User-Agent"], "-H", "Accept: image/*,*/*",
-                       "-H", "Referer: https://catbox.moe/", "--fail", "--silent", "--show-error",
-                       "-o", "downloaded.bin", url],
-                      capture_output=True, text=True, timeout=90
+                      ["curl", "-L", "-A", headers["User-Agent"], "-H", f"Referer: {referer}",
+                       "--fail", "--silent", "--show-error", "-o", tmp, url],
+                      capture_output=True, text=True, timeout=180
                   )
-                  if result.returncode == 0 and os.path.exists("downloaded.bin"):
-                      with open("downloaded.bin", "rb") as f:
+                  if result.returncode == 0 and os.path.exists(tmp):
+                      with open(tmp, "rb") as f:
                           content = f.read()
-                      print(f"Downloaded with curl ({len(content)} bytes)")
+                      print(f"curl ok → {len(content)} bytes")
                   else:
-                      print("curl stderr:", result.stderr)
-              except Exception as e:
-                  last_err = e
-                  print(f"curl failed: {e}")
+                      print(result.stderr)
+                      raise SystemExit(f"Download failed: {last_err}")
+              if out_path:
+                  with open(out_path, "wb") as f:
+                      f.write(content)
+              return content
 
-          if content is None or len(content) < 100:
-              raise SystemExit(f"Could not download image. Last error: {last_err}")
+          # ---------- 1. Download input image ----------
+          img_url = "${{ github.event.inputs.image_url }}"
+          print("=== Downloading input image ===")
+          img_bytes = download(img_url, referer="https://catbox.moe/")
+          arr = np.frombuffer(img_bytes, np.uint8)
+          img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+          if img_bgr is None:
+              raise SystemExit("Cannot decode input image")
+          h0, w0 = img_bgr.shape[:2]
+          print(f"Original size: {w0}x{h0}")
 
-          img_array = np.frombuffer(content, np.uint8)
-          img = cv2.imdecode(img_array, cv2.IMREAD_GRAYSCALE)
-          if img is None:
-              # try color then convert
-              img_color = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-              if img_color is None:
-                  raise SystemExit("Failed to decode image – check that the URL points to a valid image file")
-              img = cv2.cvtColor(img_color, cv2.COLOR_BGR2GRAY)
+          # Keep a reasonable size for the model (NAFNet is trained around 512–1024)
+          max_side = 1024
+          scale = min(1.0, max_side / max(h0, w0))
+          if scale < 1.0:
+              new_w, new_h = int(w0 * scale), int(h0 * scale)
+              img_bgr = cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+              print(f"Resized for model: {new_w}x{new_h}")
 
-          print(f"Image size: {img.shape[1]}x{img.shape[0]}")
+          # ---------- 2. Download NAFNet ONNX (real neural deblur) ----------
+          model_path = "nafnet.onnx"
+          if not os.path.exists(model_path):
+              print("=== Downloading NAFNet model (~92 MB) ===")
+              model_url = "https://huggingface.co/opencv/deblurring_nafnet/resolve/main/deblurring_nafnet_2025may.onnx"
+              download(model_url, out_path=model_path)
 
-          # Denoise
-          den = cv2.fastNlMeansDenoising(img, h=8)
-          # Contrast enhancement
-          clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8,8))
+          # ---------- 3. Neural deblurring ----------
+          print("=== Running NAFNet deblur (CPU) ===")
+          session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+          input_name = session.get_inputs()[0].name
+
+          # NAFNet expects RGB float32 [0,1], NCHW
+          img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+          blob = np.transpose(img_rgb, (2, 0, 1))[None, ...]  # 1x3xHxW
+
+          # Some ONNX exports want fixed size; we pad to multiple of 8 if needed
+          _, _, h, w = blob.shape
+          pad_h = (8 - h % 8) % 8
+          pad_w = (8 - w % 8) % 8
+          if pad_h or pad_w:
+              blob = np.pad(blob, ((0,0),(0,0),(0,pad_h),(0,pad_w)), mode="reflect")
+
+          out = session.run(None, {input_name: blob})[0]
+          out = out[0, :, :h, :w]  # remove pad
+          out = np.transpose(out, (1, 2, 0))
+          out = np.clip(out * 255.0, 0, 255).astype(np.uint8)
+          deblurred_bgr = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
+
+          # Resize back to original if we downscaled
+          if scale < 1.0:
+              deblurred_bgr = cv2.resize(deblurred_bgr, (w0, h0), interpolation=cv2.INTER_LANCZOS4)
+
+          cv2.imwrite("deblurred_color.png", deblurred_bgr)
+          print("Saved deblurred_color.png")
+
+          # ---------- 4. Text-optimized post-process ----------
+          gray = cv2.cvtColor(deblurred_bgr, cv2.COLOR_BGR2GRAY)
+
+          # Mild denoise + CLAHE
+          den = cv2.fastNlMeansDenoising(gray, h=6)
+          clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
           enh = clahe.apply(den)
-          # Unsharp mask
-          blur = cv2.GaussianBlur(enh, (0,0), 1.5)
-          sharp = cv2.addWeighted(enh, 1.8, blur, -0.8, 0)
-          # Binary threshold for clean black text on white
-          _, bin_img = cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-          cv2.imwrite("unblurred.png", bin_img)
-          print("Done → unblurred.png")
+
+          # Stronger unsharp for text edges
+          blur = cv2.GaussianBlur(enh, (0, 0), 1.2)
+          sharp = cv2.addWeighted(enh, 2.0, blur, -1.0, 0)
+
+          # Adaptive threshold (much better than global Otsu for text)
+          binary = cv2.adaptiveThreshold(
+              sharp, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+              cv2.THRESH_BINARY, 31, 12
+          )
+
+          # Optional morphological clean-up (remove tiny speckles, close gaps)
+          kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+          binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+          binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+          cv2.imwrite("unblurred_text.png", binary)
+          print("Saved unblurred_text.png")
+
+          # Also save a high-contrast grayscale version (often best for reading)
+          cv2.imwrite("unblurred_gray.png", sharp)
+          print("Saved unblurred_gray.png")
+
+          print("=== All done ===")
           EOF
 
-      - name: Upload result
+      - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: unblurred-image
-          path: unblurred.png
+          name: unblurred-results
+          path: |
+            deblurred_color.png
+            unblurred_text.png
+            unblurred_gray.png
